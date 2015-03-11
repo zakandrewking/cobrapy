@@ -44,6 +44,7 @@ GENELIST_TAG = "fbc:listOfGeneProducts"
 GENE_TAG = "fbc:geneProduct"
 # XPATHS
 BOUND_XPATH = "sbml:listOfParameters/sbml:parameter"  # TODO only get constant
+COMPARTMENT_XPATH = "sbml:listOfCompartments/sbml:compartment"
 GENES_XPATH = GENELIST_TAG + "/" + GENE_TAG
 SPECIES_XPATH = "sbml:listOfSpecies/sbml:species[@boundaryCondition='%s']"
 OBJECTIVES_XPATH = ("fbc:objective[@fbc:id='%s']/"
@@ -110,8 +111,13 @@ def construct_gpr_xml(parent, expression):
 
 def parse_xml_into_model(xml, number=float):
     xml_model = xml.find(ns("sbml:model"))
+    if get_attrib(xml_model, "fbc:strict") != "true":
+        warn('loading SBML model without fbc:strict="true"')
     model = Model()
     model.id = get_attrib(xml_model, "id")
+
+    model.compartments = {c.get("id"): c.get("name") for c in
+                          xml.findall(ns(COMPARTMENT_XPATH))}
 
     # add metabolites
     for species in xml_model.findall(ns(SPECIES_XPATH) % 'false'):
@@ -131,7 +137,7 @@ def parse_xml_into_model(xml, number=float):
     for sbml_gene in xml_model.findall(ns(GENES_XPATH)):
         gene_id = get_attrib(sbml_gene, "fbc:id").replace(SBML_DOT, ".")
         gene = Gene(gene_id)
-        gene.name = get_attrib(sbml_gene, "fbc:name")
+        gene.name = get_attrib(sbml_gene, "fbc:label")
         model.genes.append(gene)
 
     or_tag = ns(OR_TAG)
@@ -215,12 +221,27 @@ def parse_xml_into_model(xml, number=float):
     return model
 
 
-def model_to_xml(cobra_model):
+def model_to_xml(cobra_model, units=True):
     xml = Element("sbml", xmlns=namespaces["sbml"], level="3", version="1")
     set_attrib(xml, "fbc:required", "false")
     xml_model = SubElement(xml, "model")
+    set_attrib(xml_model, "fbc:strict", "true")
     if cobra_model.id is not None:
         xml_model.set("id", cobra_model.id)
+
+    # if using units, add in mmol/gdw/hr
+    if units:
+        unit_def = SubElement(
+            SubElement(xml_model, "listOfUnitDefinitions"),
+            "unitDefinition", id="mmol_per_gDW_per_hr")
+        list_of_units = SubElement(unit_def, "listOfUnits")
+        SubElement(list_of_units, "unit", kind="mole", scale="-3",
+                   multiplier="1", exponent="1")
+        SubElement(list_of_units, "unit", kind="gram", scale="0",
+                   multiplier="1", exponent="-1")
+        SubElement(list_of_units, "unit", kind="second", scale="0",
+                   multiplier="3600", exponent="-1")
+
     # create the element for the flux objective
     obj_list_tmp = SubElement(xml_model, ns("fbc:listOfObjectives"))
     set_attrib(obj_list_tmp, "fbc:activeObjective", "obj")
@@ -232,15 +253,18 @@ def model_to_xml(cobra_model):
 
     # create the element for the flux bound parameters
     parameter_list = SubElement(xml_model, "listOfParameters")
+    param_attr = {"constant": "true"}
+    if units:
+        param_attr["units"] = "mmol_per_gDW_per_hr"
     # the most common bounds are the minimum, maxmium, and 0
     min_value = min(cobra_model.reactions.list_attr("lower_bound"))
     max_value = max(cobra_model.reactions.list_attr("upper_bound"))
     SubElement(parameter_list, "parameter", value=strnum(min_value),
-               id="cobra_default_lb", constant="true")
+               id="cobra_default_lb", **param_attr)
     SubElement(parameter_list, "parameter", value=strnum(max_value),
-               id="cobra_default_ub", constant="true")
+               id="cobra_default_ub", **param_attr)
     SubElement(parameter_list, "parameter", value="0",
-               id="cobra_0_bound", constant="true")
+               id="cobra_0_bound", **param_attr)
 
     def create_bound(reaction, bound_type):
         """returns the str id of the appropriate bound for the reaction
@@ -256,7 +280,7 @@ def model_to_xml(cobra_model):
         else:
             param_id = "R_" + reaction.id + "_" + bound_type
             SubElement(parameter_list, "parameter", id=param_id,
-                       value=strnum(value), constant="true")
+                       value=strnum(value), **param_attr)
             return param_id
 
     # add in compartments
@@ -287,6 +311,10 @@ def model_to_xml(cobra_model):
         gene_id = gene.id.replace(".", SBML_DOT)
         sbml_gene = SubElement(genes_list, ns(GENE_TAG))
         set_attrib(sbml_gene, "fbc:id", gene_id)
+        name = gene.name
+        if name is None or len(name) == 0:
+            name = gene.id
+        set_attrib(sbml_gene, "fbc:label", name)
         set_attrib(sbml_gene, "fbc:name", gene.name)
 
     # add in reactions
@@ -356,8 +384,8 @@ def read_sbml_model(filename, number=float):
     return parse_xml_into_model(xml, number=number)
 
 
-def write_sbml_model(cobra_model, filename, pretty_print=False):
-    xml = model_to_xml(cobra_model)
+def write_sbml_model(cobra_model, filename, pretty_print=False, **kwargs):
+    xml = model_to_xml(cobra_model, **kwargs)
     if _with_lxml:
         xml_str = tostring(xml, pretty_print=pretty_print, encoding="UTF-8",
                            xml_declaration=True)
