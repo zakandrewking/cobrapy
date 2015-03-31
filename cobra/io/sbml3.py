@@ -7,15 +7,13 @@ from six import iteritems
 
 from .. import Metabolite, Reaction, Gene, Model
 
-# import xml parsing libraries
-from xml.dom import minidom  # only used for prettyprinting
-_with_lxml = False  # lxml also works, but is actually slower
+
 try:
     from xml.etree.cElementTree import parse, Element, SubElement, \
-        tostring, register_namespace
+        ElementTree, tostring, register_namespace
 except ImportError:
     from xml.etree.ElementTree import parse, Element, SubElement, \
-        tostring, register_namespace
+        ElementTree, tostring, register_namespace
 
 try:
     from sympy import Basic
@@ -381,18 +379,32 @@ def model_to_xml(cobra_model, units=True):
 def read_sbml_model(filename, number=float):
     xmlfile = parse(filename)
     xml = xmlfile.getroot()
+    if xml.get("level") != 3 or xml.get("version") != 2 or \
+            get_attrib("fbc:required") is None:
+        # TODO use legacy function or libsbml converter
+        raise Exception("This module requires sbml level 3 v 1 with fbc v2")
     return parse_xml_into_model(xml, number=number)
 
 
-def write_sbml_model(cobra_model, filename, pretty_print=False, **kwargs):
+def write_sbml_model(cobra_model, filename, **kwargs):
     xml = model_to_xml(cobra_model, **kwargs)
-    if _with_lxml:
-        xml_str = tostring(xml, pretty_print=pretty_print, encoding="UTF-8",
-                           xml_declaration=True)
+    indent_xml(xml)
+    ElementTree(xml).write(filename, encoding="UTF-8")
+
+
+# inspired by http://effbot.org/zone/element-lib.htm#prettyprint
+def indent_xml(elem, level=0):
+    """indent xml for pretty printing"""
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+        for elem in elem:
+            indent_xml(elem, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
     else:
-        xml_str = tostring(xml)
-        if pretty_print:
-            minidom_xml = minidom.parseString(tostring(xml))
-            xml_str = minidom_xml.toprettyxml(indent="  ", encoding="UTF-8")
-    with open(filename, "w") as outfile:
-        outfile.write(xml_str)
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
