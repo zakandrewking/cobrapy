@@ -2,6 +2,7 @@ from collections import defaultdict
 from warnings import warn
 from decimal import Decimal
 from ast import parse as ast_parse, Name, Or, And, BoolOp
+import re
 
 from six import iteritems
 
@@ -33,6 +34,21 @@ fbc_prefix = "{" + namespaces["fbc"] + "}"
 sbml_prefix = "{" + namespaces["sbml"] + "}"
 
 SBML_DOT = "__SBML_DOT__"
+SBML_DASH = "__SBML_DASH__"
+SBML_GENE_PREFIX = "G_"
+
+def add_gene_prefix(gpr):
+    matches = re.findall(r'([^() ]+)', gpr)
+    if matches:
+        gene_matches = [g for g in matches if g.strip().lower() not in ['or', 'and']]
+        for gene_match in gene_matches:
+            gpr = re.sub(r'(^|[()\s])' + gene_match + r'([()\s]|$)', r'\1' + SBML_GENE_PREFIX + gene_match + r'\2', gpr)
+    return gpr
+            
+def remove_gene_prefix(gpr):
+    gpr = re.sub(r'(^|[()\s])'  + SBML_GENE_PREFIX, r'\1', gpr)
+    return gpr
+            
 # FBC TAGS
 OR_TAG = "fbc:or"
 AND_TAG = "fbc:and"
@@ -133,7 +149,9 @@ def parse_xml_into_model(xml, number=float):
 
     # add genes
     for sbml_gene in xml_model.findall(ns(GENES_XPATH)):
-        gene_id = get_attrib(sbml_gene, "fbc:id").replace(SBML_DOT, ".")
+        gene_id = get_attrib(sbml_gene, "fbc:id").replace(SBML_DOT, ".").replace(SBML_DASH, "-")
+        gene_id = remove_gene_prefix(gene_id)
+
         gene = Gene(gene_id)
         gene.name = get_attrib(sbml_gene, "fbc:label")
         model.genes.append(gene)
@@ -203,7 +221,9 @@ def parse_xml_into_model(xml, number=float):
         # remove outside parenthesis, if any
         if gpr.startswith("(") and gpr.endswith(")"):
             gpr = gpr[1:-1].strip()
-        gpr = gpr.replace(SBML_DOT, ".")
+        gpr = gpr.replace(SBML_DOT, ".").replace(SBML_DASH, "-")
+        gpr = remove_gene_prefix(gpr)
+
         reaction.gene_reaction_rule = gpr
     model.add_reactions(reactions)
 
@@ -306,7 +326,9 @@ def model_to_xml(cobra_model, units=True):
     if len(cobra_model.genes) > 0:
         genes_list = SubElement(xml_model, ns(GENELIST_TAG))
     for gene in cobra_model.genes:
-        gene_id = gene.id.replace(".", SBML_DOT)
+        gene_id = gene.id.replace(".", SBML_DOT).replace("-", SBML_DASH)
+        gene_id = add_gene_prefix(gene_id)
+
         sbml_gene = SubElement(genes_list, ns(GENE_TAG))
         set_attrib(sbml_gene, "fbc:id", gene_id)
         name = gene.name
@@ -363,15 +385,18 @@ def model_to_xml(cobra_model, units=True):
         # gene reaction rule
         gpr = reaction.gene_reaction_rule
         if gpr is not None and len(gpr) > 0:
-            gpr = gpr.replace(".", SBML_DOT)
+            gpr = gpr.replace(".", SBML_DOT).replace("-", SBML_DASH)
+            gpr = add_gene_prefix(gpr)
+            
             gpr_xml = SubElement(sbml_reaction, ns(GPR_TAG))
-            try:
+            # try:
+            if True:
                 parsed = ast_parse(gpr, filename="<string>", mode="eval")
                 construct_gpr_xml(gpr_xml, parsed.body)
-            except Exception as e:
-                print("failed on '%s' in %s" %
-                      (reaction.gene_reaction_rule, repr(reaction)))
-                raise e
+            # except Exception as e:
+            #     print("failed on '%s' in %s" %
+            #           (reaction.gene_reaction_rule, repr(reaction)))
+            #     raise e
 
     return xml
 
@@ -379,8 +404,7 @@ def model_to_xml(cobra_model, units=True):
 def read_sbml_model(filename, number=float):
     xmlfile = parse(filename)
     xml = xmlfile.getroot()
-    if xml.get("level") != 3 or xml.get("version") != 2 or \
-            get_attrib("fbc:required") is None:
+    if xml.get("level") != '3' or xml.get("version") != '1' or get_attrib(xml, "fbc:required") is None:
         # TODO use legacy function or libsbml converter
         raise Exception("This module requires sbml level 3 v 1 with fbc v2")
     return parse_xml_into_model(xml, number=number)
