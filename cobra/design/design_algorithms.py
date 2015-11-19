@@ -31,8 +31,29 @@ def _add_decision_variable(model, reaction_id):
     return var
 
 
+def _run_knock(knock_problem, objective_sense='maximize', solver=None,
+               tolerance_integer=1e-9, **kwargs):
+    """Optimize and update solution with knockouts.
+
+    Zachary King 2015
+
+    """
+    solution = knock_problem.optimize(objective_sense=objective_sense,
+                                      solver=solver,
+                                      tolerance_integer=tolerance_integer,
+                                      **kwargs)
+    solution.knockouts = []
+    if solution.x_dict is not None:
+        for reaction in knock_problem.reactions:
+            if solution.x_dict.get(reaction.id, None) == 0:
+                r_id = getattr(reaction, "decision_reaction_id", None)
+                if r_id is not None:
+                    solution.knockouts.append(r_id)
+    return solution
+
+
 def set_up_optknock(model, chemical_objective, knockable_reactions,
-                    biomass_objective=None, n_knockouts=5,
+                    biomass_objective=None, min_biomass=None, n_knockouts=5,
                     n_knockouts_required=True, dual_maximum=1000, copy=True):
     """Set up the OptKnock problem described by Burgard et al., 2003:
 
@@ -51,6 +72,9 @@ def set_up_optknock(model, chemical_objective, knockable_reactions,
     biomass_objective: str. The ID of the reaction to maximize in the inner
     problem. By default, this is the existing objective function in the passed
     model.
+
+    min_biomass: float: If the biomass_objective is provided, then set this
+    value as a lower bound for biomass.
 
     n_knockouts: int. The number of knockouts allowable.
 
@@ -73,22 +97,216 @@ def set_up_optknock(model, chemical_objective, knockable_reactions,
     decision_variable_ids = [_add_decision_variable(model, r_id).id
                              for r_id in knockable_reactions]
 
-    # inner problem
-    inner_problem = model.copy()
-    if biomass_objective:
+    # set the biomass objective and lower bound
+    if biomass_objective is not None:
         found = False
-        for reaction in inner_problem.reactions:
+        for reaction in model.reactions:
             obj = reaction.id == biomass_objective
             reaction.objective_coefficient = 1 if obj else 0
+            if min_biomass is not None:
+                reaction.lower_bound = min_biomass
             if obj:
                 found = True
         if not found:
             raise Exception("Could not find biomass_objective %s in model" % biomass_objective)
 
+    # take the dual and combine
+    model = dual_embed(model, {chemical_objective: 1},
+                       integer_vars_to_maintain=decision_variable_ids,
+                       copy=False, dual_maximum=dual_maximum)
+
+    # add the n_knockouts constraint
+    n_knockouts_constr = Metabolite("n_knockouts_constraint")
+    n_knockouts_constr._constraint_sense = "E" if n_knockouts_required else "G"
+    n_knockouts_constr._bound = len(decision_variable_ids) - n_knockouts
+    for r_id in decision_variable_ids:
+        reaction = model.reactions.get_by_id(r_id)
+        reaction.add_metabolites({ n_knockouts_constr: 1 })
+
+    return model
+
+
+def run_optknock(optknock_problem, solver=None, **kwargs):
+    """Run the OptKnock problem created with set_up_optknock.
+
+    optknock_problem: :class:`~cobra.core.Model` object. The problem generated
+    by set_up_optknock.
+
+    solver: str. The name of the preferred solver.
+
+    **kwargs: Keyword arguments are passed to Model.optimize().
+
+
+    Zachary King 2015
+
+    """
+    return _run_knock(optknock_problem, solver=solver, **kwargs)
+
+
+def set_up_robustknock(model, chemical_objective, knockable_reactions,
+                       biomass_objective=None, min_biomass=None, n_knockouts=5,
+                       n_knockouts_required=True, dual_maximum=1e7, copy=True):
+    """Set up the Robustknock problem described by Tepper and Shlomi, 2010:
+
+        Tepper N, Shlomi T. Predicting metabolic engineering knockout strategies
+        for chemical production: accounting for competing
+        pathways. Bioinformatics. 2010;26(4):536-43. doi:10.1093/bioinformatics/btp704.
+
+
+    model : :class:`~cobra.core.Model` object.
+
+    chemical_objective: str. The ID of the reaction to maximize in the outer
+    problem.
+
+    knockable_reactions: [str]. A list of reaction IDs that can be knocked out.
+
+    biomass_objective: str. The ID of the reaction to maximize in the inner
+    problem. By default, this is the existing objective function in the passed
+    model.
+
+    min_biomass: float: If the biomass_objective is provided, then set this
+    value as a lower bound for biomass.
+
+    n_knockouts: int. The number of knockouts allowable.
+
+    n_knockouts_required: bool. Require exactly the number of knockouts
+    specified by n_knockouts.
+
+    dual_maximum: float or int. The upper bound for dual variables.
+
+    copy: bool. Copy the model before making any modifications.
+
+
+    Zachary King 2015
+
+    """
+
+    if copy:
+        model = model.copy()
+
+    # add the integer decision variables
+    decision_variable_ids = [_add_decision_variable(model, r_id).id
+                             for r_id in knockable_reactions]
+
+    # set the biomass objective and lower bound
+    if biomass_objective is not None:
+        found = False
+        for reaction in model.reactions:
+            obj = reaction.id == biomass_objective
+            reaction.objective_coefficient = 1 if obj else 0
+            if min_biomass is not None:
+                reaction.lower_bound = min_biomass
+            if obj:
+                found = True
+        if not found:
+            raise Exception("Could not find biomass_objective %s in model" % biomass_objective)
+
+    # max biomass
+    # min dual biomass
+    # min chem s.t. biomass = dual biomass (max)
+    # max - chem s.t. biomass = dual biomass (max)
+    # min dual ( - chem s.t. biomass = dual biomass (max) )
+
+    # take the dual and combine
+    model = dual_embed(model, outer_objective_dict={chemical_objective: 1},
+                       inner_objective_sense="maximize",
+                       integer_vars_to_maintain=decision_variable_ids,
+                       copy=False, dual_maximum=dual_maximum)
+
+    import ipdb; ipdb.set_trace()
+    # TODO I was debugging this. currently, the dual of model here is
+    # infeasible, even without integer vars.
+
+    # take the dual again and combine. Keep the outer objective from the dual,
+    # and do not add an equal objectives constraint
+    model = dual_embed(model, inner_objective_sense="minimize",
+                       integer_vars_to_maintain=decision_variable_ids,
+                       copy=False, dual_maximum=dual_maximum,
+                       equal_objectives_constraint_id=None)
+
+    # add the n_knockouts constraint
+    n_knockouts_constr = Metabolite("n_knockouts_constraint")
+    n_knockouts_constr._constraint_sense = "E" if n_knockouts_required else "G"
+    n_knockouts_constr._bound = len(decision_variable_ids) - n_knockouts
+    for r_id in decision_variable_ids:
+        reaction = model.reactions.get_by_id(r_id)
+        reaction.add_metabolites({ n_knockouts_constr: 1 })
+
+    return model
+
+
+def run_robustknock(robustknock_problem, solver=None, **kwargs):
+    """Run the Robustknock problem created with set_up_robustknock.
+
+    robustknock_problem: :class:`~cobra.core.Model` object. The problem generated
+    by set_up_robustknock.
+
+    solver: str. The name of the preferred solver.
+
+    **kwargs: Keyword arguments are passed to Model.optimize().
+
+
+    Zachary King 2015
+
+    """
+    return _run_knock(robustknock_problem, objective_sense="minimize",
+                      solver=solver, **kwargs)
+
+
+def dual_embed(model, outer_objective_dict=None, inner_objective_dict=None,
+               inner_objective_sense="maximize", integer_vars_to_maintain=[],
+               already_irreversible=False, copy=True, dual_maximum=1000,
+               equal_objectives_constraint_id="equal_objectives_constraint"):
+    """Embed the dual of the inner model within the outer model.
+
+    model : :class:`~cobra.core.Model` object.
+
+    outer_objective_dict: dict. Reaction IDs and coefficients for the new outer
+    objective. If None, then keep the dual objective.
+
+    inner_objective_dict: dict. Reaction IDs and coefficients for the inner
+    objective. If None, then use the current model objective.
+
+    inner_objective_sense: str. The objective sense of the inner problem, either
+    'maximize' or 'minimize'. A minimization problems will be converted to a
+    maximization before taking the dual.
+
+    iteger_vars_to_maintain: [str]. A list of IDs for Boolean integer variables
+    to be maintained in the dual problem. See the description of dual_problem()
+    for more details.
+
+    already_irreversible: Boolean. If True, then do not convert the model to
+    irreversible.
+
+    copy: bool. If True, then make a copy of the model before modifying
+    it. This is not necessary if already_irreversible is True.
+
+    dual_maximum: float or int. The upper bound for dual variables.
+
+    equal_objectives_constraint_id: str. An ID for the equal objectives
+    constraint. If None, then do not add the constraint. This is important if
+    dual embed is going to be run multiple times, because the equal objectives
+    constraints have to be distinguished.
+
+
+    Zachary King 2015
+
+    """
+
+    if copy:
+        model = model.copy()
+
+    # set the inner objective (if provided)
+    inner_problem = model.copy()
+    if inner_objective_dict is not None:
+        for reaction in inner_problem:
+            reaction.objective_coefficient = inner_objective_dict.get(reaction.id, 0)
+
     # dual of inner problem
-    inner_dual = dual_problem(inner_problem, integer_vars_to_maintain=decision_variable_ids,
-                              already_irreversible=False, copy=False,
-                              dual_maximum=dual_maximum)
+    inner_dual = dual_problem(inner_problem, objective_sense=inner_objective_sense,
+                              integer_vars_to_maintain=integer_vars_to_maintain,
+                              already_irreversible=already_irreversible,
+                              copy=False, dual_maximum=dual_maximum)
 
     # add constraints and variables from inner problem to outer problem
     inner_objectives = {}
@@ -105,66 +323,26 @@ def set_up_optknock(model, chemical_objective, knockable_reactions,
         else:
             model.add_reaction(reaction)
 
-    # constraint to set outer and inner objectives to be equal, and set chemical
+    # constraint to set outer and inner objectives to be , and set chemical
     # objective
-    equal_objectives_constr = Metabolite("equal_objectives_constraint")
-    equal_objectives_constr._constraint_sense = "E"
-    equal_objectives_constr._bound = 0
-    for reaction in model.reactions:
-        if reaction.objective_coefficient != 0:
-            reaction.add_metabolites({ equal_objectives_constr: reaction.objective_coefficient })
-        inner_objective = inner_objectives.get(reaction.id, 0)
-        if inner_objective:
-            reaction.add_metabolites({ equal_objectives_constr: - inner_objective})
-        # set chemical objective
-        reaction.objective_coefficient = 1 if reaction.id == chemical_objective else 0
+    if equal_objectives_constraint_id is not None:
+        _objectives_constr = Metabolite(equal_objectives_constraint_id)
+        _objectives_constr._constraint_sense = "E"
+        _objectives_constr._bound = 0
+        factor = -1 if inner_objective_sense == 'maximize' else 1
+        for reaction in model.reactions:
+            if reaction.objective_coefficient != 0:
+                reaction.add_metabolites({ _objectives_constr: reaction.objective_coefficient })
+            inner_objective = inner_objectives.get(reaction.id, 0)
+            if inner_objective:
+                reaction.add_metabolites({ _objectives_constr: factor * inner_objective})
 
-    # add the n_knockouts constraint
-    n_knockouts_constr = Metabolite("n_knockouts_constraint")
-    n_knockouts_constr._constraint_sense = "E" if n_knockouts_required else "G"
-    n_knockouts_constr._bound = len(decision_variable_ids) - n_knockouts
-    for r_id in decision_variable_ids:
-        reaction = model.reactions.get_by_id(r_id)
-        reaction.add_metabolites({ n_knockouts_constr: 1 })
+    # set chemical objective
+    if outer_objective_dict is not None:
+        for reaction in model.reactions:
+            reaction.objective_coefficient = outer_objective_dict.get(reaction.id, 0)
 
     return model
-
-
-def run_optknock(optknock_problem, solver=None, tolerance_integer=1e-9,
-                 **kwargs):
-    """Run the OptKnock problem created with set_up_optknock.
-
-
-    optknock_problem: :class:`~cobra.core.Model` object. The problem generated
-    by set_up_optknock.
-
-    solver: str. The name of the preferred solver.
-
-    tolerance_integer: float. The integer tolerance for the MILP.
-
-    **kwargs: Keyword arguments are passed to Model.optimize().
-
-
-    Zachary King 2015
-
-    """
-    solution = optknock_problem.optimize(solver=solver,
-                                         tolerance_integer=tolerance_integer,
-                                         **kwargs)
-    solution.knockouts = []
-    for reaction in optknock_problem.reactions:
-        if solution.x_dict.get(reaction.id, None) == 0:
-            r_id = getattr(reaction, "decision_reaction_id", None)
-            if r_id is not None:
-                solution.knockouts.append(r_id)
-    return solution
-
-
-# This function will generalize the set_up_optknock code to other MILPs:
-# def dual_embed(outer_model, inner_model, ..., objective_sense="maximize",
-#                integer_vars_to_maintain=[], already_irreversible=False,
-#                copy=True, dual_maximum=1000):
-#     """Embed the dual of the inner model within the outer model"""
 
 
 def dual_problem(model, objective_sense="maximize", integer_vars_to_maintain=[],
