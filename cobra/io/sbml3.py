@@ -544,7 +544,7 @@ def read_sbml_model(filename, number=float, **kwargs):
         # libsbml needs a file string, so write to temp file if a file handle
         if hasattr(filename, "read"):
             with NamedTemporaryFile(suffix=".xml", delete=False) as outfile:
-                xmlfile.write(outfile, encoding="UTF-8")
+                xmlfile.write(outfile, encoding="UTF-8", xml_declaration=True)
             filename = outfile.name
         return read_sbml2(filename, **kwargs)
     return parse_xml_into_model(xml, number=number, **kwargs)
