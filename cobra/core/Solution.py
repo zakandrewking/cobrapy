@@ -1,3 +1,12 @@
+from six import iteritems
+
+def dict_as_data_frame(d, sort=True):
+    df = pd.DataFrame([{'reaction': k, 'flux': v} for k, v in iteritems(d)])
+    if sort:
+        # sort by descending abs(flux)
+        df = df.reindex(df.flux.abs().order(ascending=False).index)
+    return df
+
 class Solution(object):
     """Stores the solution from optimizing a cobra.Model. This is
     used to provide a single interface to results from different
@@ -37,3 +46,7 @@ class Solution(object):
         if self.f is None:
             return "<Solution '%s' at 0x%x>" % (self.status, id(self))
         return "<Solution %.2f at 0x%x>" % (self.f, id(self))
+
+    def x_as_data_frame(self):
+        """Return the primal solution as a DataFrame."""
+        return dict_as_data_frame(self.x_dict)
